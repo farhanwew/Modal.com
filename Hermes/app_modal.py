@@ -2,7 +2,6 @@ import os
 import modal
 from typing import Optional, Dict
 from pydantic import BaseModel
-from fastapi.responses import 
 from modal import Image
 
 APP_NAME = "eros-mistral-modal"
@@ -56,34 +55,68 @@ SAFE_DEFAULT_SYSTEM_PROMPT = (
 )
 
 class GenerateRequest(BaseModel):
+    # Required
     prompt: str
+    
+    # Core parameters dari JSON yang kamu berikan
     system_prompt: Optional[str] = None
     prompt_template: str = PROMPT_TEMPLATE
     max_tokens: int = 512
+    temperature: float = 0.8
     top_p: float = 0.95
     top_k: int = 10
     min_p: float = 0.0
     typical_p: float = 1.0
     tfs: float = 1.0
+    repeat_penalty: float = 1.1
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
-    repeat_penalty: float = 1.1
-    temperature: float = 0.8
-    mirostat_mode: str = "Disabled"     
-    mirostat_learning_rate: float = 0.1
+    mirostat_mode: str = "Disabled"
     mirostat_entropy: float = 5.0
+    mirostat_learning_rate: float = 0.1
+    
+    # Optional
     seed: Optional[int] = None
     control_vector: Optional[str] = None  
     
 def _clamp_and_validate(body: GenerateRequest):
-    if body.max_tokens > 2048:
-        body.max_tokens = 2048
+    # Clamp max_tokens
+    if body.max_tokens > 4096:
+        body.max_tokens = 4096
     if body.max_tokens < 1:
         body.max_tokens = 1
-    if len(body.prompt) > 20000:
-        raise ValueError("prompt terlalu panjang")
+        
+    # Validate prompt length
+    if len(body.prompt) > 50000:
+        raise ValueError("prompt terlalu panjang (max 50k chars)")
+        
+    # Clamp temperature
+    if body.temperature < 0.01:
+        body.temperature = 0.01
+    if body.temperature > 2.0:
+        body.temperature = 2.0
+        
+    # Clamp top_p
+    if body.top_p < 0.01:
+        body.top_p = 0.01
+    if body.top_p > 1.0:
+        body.top_p = 1.0
+        
+    # Clamp top_k
+    if body.top_k < 1:
+        body.top_k = 1
+    if body.top_k > 200:
+        body.top_k = 200
+        
+    # Clamp repeat_penalty
+    if body.repeat_penalty < 0.1:
+        body.repeat_penalty = 0.1
+    if body.repeat_penalty > 2.0:
+        body.repeat_penalty = 2.0
+        
+    # Validate control vector
     if body.control_vector and not body.control_vector.endswith(".npz"):
-        raise ValueError("control_vector harus .npz")
+        raise ValueError("control_vector harus file .npz")
 
 @app.function(image=serve_image, volumes={"/models": vol})
 def prewarm_models():
@@ -99,72 +132,68 @@ def prewarm_models():
     )
     return "ok"
 
+
 @app.cls(
     gpu=GPU_TYPE,
     image=serve_image,
     secrets=[modal.Secret.from_name("my-huggingface-secret")],
     volumes={"/models": vol},
     timeout=600,
-    container_idle_timeout=300,
-    allow_concurrent_inputs=5,
+    scaledown_window=90,
+    # allow_concurrent_inputs=2,  # deprecated
 )
+
+@modal.concurrent(max_inputs=2)
 class InferenceWorker:
     @modal.enter()
     def start_engine(self):
         import os as _os
-        import numpy as np
-        import torch
+        import numpy as np, torch
         from transformers import (
-            LlamaTokenizer,
-            MistralForCausalLM,
-            TextIteratorStreamer,
-            set_seed,
+            LlamaTokenizer, MistralForCausalLM, TextIteratorStreamer, set_seed
         )
-        from huggingface_hub import snapshot_download
-        
-        # Import repeng dan hijack jika ada
+
+        # --- repeng tanpa hijack (agar control jalan walau hijack tak ada) ---
+        try:
+            from .hijack import hijack_samplers
+            hijack_samplers() 
+            print('succeed to import hijack')
+        except:
+            print('failed to import hijack')
+        # patch transformers (sekali per proses)
         try:
             from repeng import ControlModel, ControlVector
-            from hijack import hijack_samplers
             self.ControlModel = ControlModel
             self.ControlVector = ControlVector
-            hijack_samplers()
             self.use_control = True
-            
-        except ImportError:
-            print("repeng or hijack not available, using standard model")
+        except Exception as e:
+            print(f"repeng not available: {e}")
             self.use_control = False
 
-        self.np = np
-        self.torch = torch
-        self.TextIteratorStreamer = TextIteratorStreamer
-        self.set_seed = set_seed
+        self.np, self.torch = np, torch
+        self.TextIteratorStreamer, self.set_seed = TextIteratorStreamer, set_seed
 
         _os.makedirs(MODEL_DIR, exist_ok=True)
-        snapshot_download(
-            repo_id=_os.environ.get("HF_REPO_ID", HF_REPO_ID),
-            local_dir=MODEL_DIR,
-            local_dir_use_symlinks=False,
-            token=_os.environ.get("HUGGINGFACE_HUB_TOKEN"),
-        )
+
+        # --- NO snapshot_download here ---
+        # Guard: pastikan directory sudah terisi (hasil prewarm)
+        required = ["config.json", "tokenizer.json", "tokenizer.model"]
+        missing = [p for p in required if not _os.path.exists(_os.path.join(MODEL_DIR, p))]
+        if missing:
+            raise RuntimeError(f"Model not found in {MODEL_DIR}. Run prewarm_models first. Missing: {missing}")
 
         self.tokenizer = LlamaTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
         try:
             self.model = MistralForCausalLM.from_pretrained(
-                MODEL_DIR,
-                attn_implementation="flash_attention_2",
-                torch_dtype=torch.float16,
-                device_map="auto",
+                MODEL_DIR, attn_implementation="flash_attention_2",
+                torch_dtype=torch.float16, device_map="auto"
             )
         except Exception:
             self.model = MistralForCausalLM.from_pretrained(
-                MODEL_DIR,
-                attn_implementation="eager",
-                torch_dtype=torch.float16,
-                device_map="auto",
+                MODEL_DIR, attn_implementation="eager",
+                torch_dtype=torch.float16, device_map="auto"
             )
 
-        # Apply control model if available
         if self.use_control:
             self.model = self.ControlModel(self.model, list(range(-5, -18, -1)))
 
@@ -182,20 +211,71 @@ class InferenceWorker:
             if body.seed is not None:
                 self.set_seed(body.seed)
 
+            # Load control vector jika ada
+            if body.control_vector and self.use_control:
+                try:
+                    control_vector_path = f"/models/{body.control_vector}"
+                    if os.path.exists(control_vector_path):
+                        control_vector = self.ControlVector.from_pretrained(control_vector_path)
+                        # Set control vector ke model
+                        self.model.set_control(control_vector)
+                        print(f"Applied control vector: {body.control_vector}")
+                    else:
+                        print(f"Control vector not found: {control_vector_path}")
+                except Exception as e:
+                    print(f"Failed to load control vector: {e}")
+
             inputs = self.tokenizer(full_prompt, return_tensors="pt").to(self.model.device)
             
-            # Generate dengan parameter yang ada
+            # Generate dengan parameter sesuai JSON yang kamu tentukan
+            generation_kwargs = {
+                **inputs,
+                "pad_token_id": self.tokenizer.eos_token_id,
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "do_sample": True,
+                "max_new_tokens": body.max_tokens,
+                "temperature": body.temperature,
+                "top_p": body.top_p,
+                "top_k": body.top_k,
+                "repetition_penalty": body.repeat_penalty,
+            }
+
+            # Add optional parameters jika nilainya tidak default
+            if body.min_p > 0.0:
+                generation_kwargs["min_p"] = body.min_p
+                
+            if body.typical_p != 1.0:
+                generation_kwargs["typical_p"] = body.typical_p
+                
+            if body.tfs != 1.0:
+                generation_kwargs["tfs"] = body.tfs
+                
+            if body.frequency_penalty != 0.0:
+                generation_kwargs["frequency_penalty"] = body.frequency_penalty
+                
+            if body.presence_penalty != 0.0:
+                generation_kwargs["presence_penalty"] = body.presence_penalty
+
+            # Mirostat parameters
+            if body.mirostat_mode != "Disabled":
+                if body.mirostat_mode.lower() in ["mirostat", "mirostat_v1", "1"]:
+                    generation_kwargs["mirostat_mode"] = 1
+                elif body.mirostat_mode.lower() in ["mirostat_v2", "2"]:
+                    generation_kwargs["mirostat_mode"] = 2
+                
+                if "mirostat_mode" in generation_kwargs:
+                    generation_kwargs["mirostat_tau"] = body.mirostat_entropy
+                    generation_kwargs["mirostat_eta"] = body.mirostat_learning_rate
+
             with self.torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    do_sample=True,
-                    max_new_tokens=body.max_tokens,
-                    top_p=body.top_p,
-                    top_k=body.top_k,
-                    temperature=body.temperature,
-                    repetition_penalty=body.repeat_penalty,
-                )
+                outputs = self.model.generate(**generation_kwargs)
+            
+            # Reset control vector setelah generate (optional)
+            if body.control_vector and self.use_control:
+                try:
+                    self.model.reset()
+                except:
+                    pass
             
             # Decode output
             generated_text = self.tokenizer.decode(
@@ -222,7 +302,7 @@ class InferenceWorker:
     image=serve_image,
     secrets=[modal.Secret.from_name("my-huggingface-secret")],
 )
-@modal.web_endpoint(method="POST")
+@modal.fastapi_endpoint(method="POST")
 def generate_endpoint(param: Dict):
     """Web endpoint yang mengikuti pattern dari contoh"""
     try:
@@ -265,37 +345,25 @@ def test_generate(prompt: str = "Hello, how are you?"):
     timeout=300,
 )
 def simple_generate(prompt: str, max_tokens: int = 512):
-    """Fungsi generate sederhana yang bekerja langsung"""
-    import os as _os
-    import torch
-    from transformers import LlamaTokenizer, MistralForCausalLM, set_seed
-    from huggingface_hub import snapshot_download
-    
-    # Download model if needed
+    import os as _os, torch
+    from transformers import LlamaTokenizer, MistralForCausalLM
+
     _os.makedirs(MODEL_DIR, exist_ok=True)
-    snapshot_download(
-        repo_id=_os.environ.get("HF_REPO_ID", HF_REPO_ID),
-        local_dir=MODEL_DIR,
-        local_dir_use_symlinks=False,
-        token=_os.environ.get("HUGGINGFACE_HUB_TOKEN"),
-    )
-    
-    # Load tokenizer and model
+    required = ["config.json", "tokenizer.json", "tokenizer.model"]
+    missing = [p for p in required if not _os.path.exists(_os.path.join(MODEL_DIR, p))]
+    if missing:
+        return {"error": f"Model not found in {MODEL_DIR}. Jalankan prewarm_models dulu. Missing: {missing}"}
+
     tokenizer = LlamaTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
-    
     try:
         model = MistralForCausalLM.from_pretrained(
-            MODEL_DIR,
-            attn_implementation="flash_attention_2",
-            torch_dtype=torch.float16,
-            device_map="auto",
+            MODEL_DIR, attn_implementation="flash_attention_2",
+            torch_dtype=torch.float16, device_map="auto"
         )
     except Exception:
         model = MistralForCausalLM.from_pretrained(
-            MODEL_DIR,
-            attn_implementation="eager", 
-            torch_dtype=torch.float16,
-            device_map="auto",
+            MODEL_DIR, attn_implementation="eager",
+            torch_dtype=torch.float16, device_map="auto"
         )
     
     # Format prompt
@@ -328,7 +396,47 @@ def simple_generate(prompt: str, max_tokens: int = 512):
     
     return {"text": generated_text.strip()}
 
-# ============ LOCAL ENTRYPOINT UNTUK TESTING ============
+# ============ FUNGSI UNTUK MEMBUAT CONTROL VECTOR ============
+
+@app.function(
+    image=serve_image,
+    secrets=[modal.Secret.from_name("my-huggingface-secret")],
+    volumes={"/models": vol},
+)
+def create_control_vector(
+    positive_prompts: list,
+    negative_prompts: list,
+    vector_name: str = "custom_control"
+):
+    """Membuat control vector dari prompt positif dan negatif"""
+    import numpy as np
+    from repeng import ControlVector
+    
+    try:
+        # Load tokenizer
+        from transformers import LlamaTokenizer
+        tokenizer = LlamaTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
+        
+        # Create control vector
+        control_vector = ControlVector.train(
+            model=None,  # Will be loaded automatically
+            tokenizer=tokenizer,
+            positive_prompts=positive_prompts,
+            negative_prompts=negative_prompts,
+        )
+        
+        # Save control vector
+        vector_path = f"/models/{vector_name}.npz"
+        control_vector.save(vector_path)
+        
+        return {
+            "success": True,
+            "vector_path": vector_path,
+            "vector_name": f"{vector_name}.npz"
+        }
+        
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.local_entrypoint()
 def main():
