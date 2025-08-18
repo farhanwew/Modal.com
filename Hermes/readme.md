@@ -1,5 +1,3 @@
----
-
 # 🔌 Request & cURL (Full Parameters)
 
 ## 1. cURL
