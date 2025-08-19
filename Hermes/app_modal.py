@@ -336,13 +336,8 @@ def generate_endpoint(param: Dict):
     gpu=GPU_TYPE,
     timeout=300,
 )
-def test_generate(prompt: str = "Hello, how are you?"):
-    """Fungsi test sederhana"""
-    worker = InferenceWorker()
-    request = GenerateRequest(prompt=prompt, max_tokens=100)
-    return worker.generate_text.remote(request)
 
-# ============ FUNGSI GENERATE SEDERHANA TANPA CLASS ============
+
 
 @app.function(
     image=serve_image,
