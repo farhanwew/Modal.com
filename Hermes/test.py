@@ -2,7 +2,7 @@ import numpy as np
 import io, codecs
 
 # bikin array numpy
-arr = np.array([1,2,3])
+arr = np.load('Hermes/kekbot.npy', allow_pickle=True)
 
 # simpan ke buffer (bukan file)
 buffer = io.BytesIO()
@@ -20,7 +20,7 @@ print(b64_data)
 decoded_binary = codecs.decode(b64_data, "base64")
 
 # load array langsung dari buffer biner
-arr_restored = np.load(io.BytesIO(decoded_binary))
+arr_restored = np.load(io.BytesIO(decoded_binary), allow_pickle=True)
 print(arr_restored)   # [1 2 3]
 print(type(arr_restored))  # <class 'numpy.ndarray'>
 

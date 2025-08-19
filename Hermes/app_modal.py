@@ -7,7 +7,7 @@ import os, io, uuid, json
 from fastapi import UploadFile, File, Form
 
 APP_NAME = "eros-mistral-modal"
-GPU_TYPE = os.environ.get("MODAL_GPU", "A10")
+GPU_TYPE = os.environ.get("MODAL_GPU", "L4")
 VOLUME_NAME = os.environ.get("MODAL_VOLUME", "hf-cache-vol")
 MODEL_DIR = "/models/local"
 HF_REPO_ID = os.environ.get("HF_REPO_ID", "NousResearch/Hermes-2-Pro-Mistral-7B")
@@ -227,23 +227,51 @@ class InferenceWorker:
             return self.ControlVector(directions=directions)
         raise ValueError("Ekstensi control_vector tidak didukung.")
 
-    # ★ Added: helper — load ControlVector dari Base64 string (.npy in-memory)
     def _load_control_vector_from_b64_npy(self, b64_str: str):
         import io, codecs, numpy as np
+
         # decode base64 -> bytes
         try:
             binary = codecs.decode(b64_str.encode("utf-8"), "base64")
         except Exception as e:
             raise ValueError(f"Gagal decode base64: {e}")
-        # load numpy object (dict) dari buffer in-memory
+
+        # load numpy object (pakai allow_pickle)
         try:
-            obj = np.load(io.BytesIO(binary), allow_pickle=True).item()
+            obj = np.load(io.BytesIO(binary), allow_pickle=True)
         except Exception as e:
             raise ValueError(f"Gagal memuat .npy dari base64: {e}")
-        if not isinstance(obj, dict) or "directions" not in obj:
-            raise ValueError("Npy base64 tidak berisi dict 'directions'. Pastikan file berasal dari dataclasses.asdict(vector).")
-        directions = {int(k): v for k, v in obj["directions"].items()}
-        return self.ControlVector(directions=directions)
+
+        # Unwrap: kalau ndarray object, ambil item-nya
+        try:
+            # np.save(np.array(obj, dtype=object)) -> balikannya ndarray object dengan .item()
+            if isinstance(obj, np.ndarray) and obj.dtype == object:
+                obj = obj.item()
+        except Exception:
+            pass
+
+        # Jika sudah objek ControlVector yang dipickle -> langsung pakai
+        cv_cls = getattr(self, "ControlVector", None)
+        if cv_cls is not None and isinstance(obj, cv_cls):
+            return obj
+
+        # Jika dict -> bangun ulang ControlVector
+        if isinstance(obj, dict) and "directions" in obj:
+            directions = {int(k): v for k, v in obj["directions"].items()}
+            # repeng 0.2.2: butuh argumen POSISIONAL (model_type, directions)
+            model_type = (
+                obj.get("model_type")
+                or getattr(getattr(self, "model", None), "config", None).__dict__.get("model_type", None)
+                or "mistral"
+            )
+            return self.ControlVector(model_type, directions)
+
+        # Bentuk lain -> error
+        raise ValueError(
+            "Format .npy tidak dikenali: bukan ControlVector ter-pickle dan tidak berisi dict 'directions'."
+        )
+
+
 
     @modal.method()
     def generate_text(self, body: GenerateRequest):
