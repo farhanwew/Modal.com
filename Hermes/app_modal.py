@@ -3,6 +3,8 @@ import modal
 from typing import Optional, Dict
 from pydantic import BaseModel
 from modal import Image
+import os, io, uuid, json
+from fastapi import UploadFile, File, Form
 
 APP_NAME = "eros-mistral-modal"
 GPU_TYPE = os.environ.get("MODAL_GPU", "A10")   
@@ -211,15 +213,20 @@ class InferenceWorker:
             if body.seed is not None:
                 self.set_seed(body.seed)
 
+      
             # Load control vector jika ada
             if body.control_vector and self.use_control:
                 try:
-                    control_vector_path = f"/models/{body.control_vector}"
+                    # NEW: dukung path absolut (mis. /tmp/xxx.npz), else fallback ke /models/<rel>
+                    if os.path.isabs(body.control_vector):
+                        control_vector_path = body.control_vector
+                    else:
+                        control_vector_path = f"/models/{body.control_vector}"
+
                     if os.path.exists(control_vector_path):
                         control_vector = self.ControlVector.from_pretrained(control_vector_path)
-                        # Set control vector ke model
                         self.model.set_control(control_vector)
-                        print(f"Applied control vector: {body.control_vector}")
+                        print(f"Applied control vector: {control_vector_path}")
                     else:
                         print(f"Control vector not found: {control_vector_path}")
                 except Exception as e:
@@ -438,6 +445,51 @@ def create_control_vector(
     except Exception as e:
         return {"error": str(e)}
 
+@app.function(image=serve_image)  # TIDAK perlu mount volume
+@modal.fastapi_endpoint(method="POST")
+def generate_with_upload_inmemory(
+    file: UploadFile = File(...),
+    payload: str = Form(...),
+):
+    """
+    Multipart endpoint (tanpa Volume):
+    - file: *.npz (wajib)
+    - payload: JSON untuk GenerateRequest
+    """
+    # parse payload JSON -> dict
+    params = json.loads(payload)
+
+    # validasi ekstensi
+    fname = (file.filename or "").strip()
+    if not fname.lower().endswith(".npz"):
+        return {"error": "file harus .npz"}
+
+    # simpan SEMENTARA ke /tmp (ephemeral)
+    stem = os.path.splitext(os.path.basename(fname))[0]
+    safe = "".join(c for c in stem if c.isalnum() or c in ("-", "_"))[:80] or "vector"
+    uid = uuid.uuid4().hex[:8]
+    tmp_path = f"/tmp/{safe}-{uid}.npz"
+
+    data = file.file.read()
+    with open(tmp_path, "wb") as f:
+        f.write(data)
+
+    # arahkan worker memakai path absolut /tmp/...
+    params["control_vector"] = tmp_path
+
+    # jalankan pipeline existing
+    body = GenerateRequest(**params)
+    worker = InferenceWorker()
+    result = worker.generate_text.remote(body)
+
+    # (opsional) bersihkan file di /tmp setelah dipakai satu kali
+    try:
+        os.remove(tmp_path)
+    except Exception:
+        pass
+
+    return {"result": result}
+
 @app.local_entrypoint()
 def main():
     """Test lokal untuk debug"""
@@ -457,3 +509,4 @@ def main():
         print("Simple generate result:", result)
         print(f"Generated in {time.time() - t0:.2f}s")
         print("-" * 50)
+        
