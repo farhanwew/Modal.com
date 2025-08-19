@@ -327,17 +327,6 @@ def generate_endpoint(param: Dict):
     except Exception as e:
         return {"error": str(e)}
 
-# ============ FUNGSI UNTUK TESTING ============
-
-@app.function(
-    image=serve_image,
-    secrets=[modal.Secret.from_name("my-huggingface-secret")],
-    volumes={"/models": vol},
-    gpu=GPU_TYPE,
-    timeout=300,
-)
-
-
 
 @app.function(
     image=serve_image,
