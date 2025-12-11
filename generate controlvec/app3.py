@@ -24,7 +24,7 @@ app  = modal.App(APP_NAME)
 
 # ========= Base Image (deps) =========
 base_image = (
-    Image.from_registry("nvidia/cuda:12.1.1-runtime-ubuntu22.04", add_python="3.10")
+    Image.from_registry("foundationmodels/flash-attention:latest", add_python="3.12")
     .apt_install("git", "curl")
     .pip_install(
         "fastapi[standard]",
@@ -39,6 +39,8 @@ base_image = (
         "safetensors",
         "huggingface-hub",
     )
+    .apt_install("build-essential", "clang", "ninja-build")
+
 )
 
 # ========= Prompt tags =========
@@ -88,7 +90,7 @@ def generate_examples(persona: str, num_examples: int, model, tokenizer) -> List
     out = model.generate(
         toks.input_ids,
         attention_mask=toks.get("attention_mask", None),
-        max_new_tokens=150,
+        max_new_tokens=32,
         temperature=0.6,
         do_sample=True,
     )
@@ -179,7 +181,7 @@ def generate_control_vector(attribute: str,
     cm.reset()
     try:
         # API baru:
-        cv = ControlVector.train(cm, tokenizer, dataset, method="pca_center")
+        cv = ControlVector.train(cm, tokenizer, dataset)
         vec_like = getattr(cv, "vector", cv)
         arr = (
             vec_like.detach().float().cpu().numpy().astype("float32")
@@ -207,7 +209,7 @@ def generate_control_vector(attribute: str,
     finally:
         cm.reset()
 
-    return arr, neg_persona
+    return cv, neg_persona
 
 
 # ========= Prewarm (download model → Volume) =========
@@ -232,6 +234,7 @@ def prewarm_models():
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
     timeout=60 * 30,
+    scaledown_window=600,
 )
 class CvecWorker:
     @modal.enter(snap=True)
@@ -253,7 +256,9 @@ class CvecWorker:
         self.model = AutoModelForCausalLM.from_pretrained(
             src,
             local_files_only=prefer_local,
-            dtype=torch.float16,
+            # dtype=torch.float16,
+            torch_dtype=torch.float16,
+            attn_implementation = "flash_attention_2",
             device_map="auto",
         )
 
@@ -285,7 +290,7 @@ class CvecWorker:
             forced_negative=forced_negative,
         )
         # Kembalikan sebagai list agar mudah diserialisasi
-        return {"vec": vec.tolist(), "neg": neg}
+        return vec, neg
 
 
 # ========= FastAPI Endpoint (pakai Worker snapshot) =========
@@ -349,9 +354,9 @@ def web_app():
                     layer_range=layer_range,
                     forced_negative=negative if len(attributes) == 1 else None,
                 )
-                vec = np.asarray(res["vec"], dtype="float32")
+                vec = res[0]
                 vectors.append(vec)
-                neg_used = negative or res["neg"]
+                neg_used = negative or res[1]
                 negatives_used.append(neg_used)
 
             if len(vectors) > 1:
@@ -361,17 +366,17 @@ def web_app():
 
             buf = io.BytesIO()
             np.save(buf, final_vector)
-            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
             filename = f"{attributes[0]}.npy" if len(attributes) == 1 else f"{'_'.join(attributes[:3])}_merged.npy"
             attr_info = attributes[0] if len(attributes) == 1 else attributes
 
             return JSONResponse({
                 "attribute": attr_info,
-                "negative_used": negatives_used[0] if len(negatives_used) == 1 else negatives_used,
+                # "negative_used": negatives_used[0] if len(negatives_used) == 1 else negatives_used,
                 "filename": filename,
                 "data_b64": b64,
-                "shape": list(final_vector.shape),
+                # "shape": list(final_vector.shape),
                 "merge_mode": (merge_mode if len(vectors) > 1 else None),
             })
 
