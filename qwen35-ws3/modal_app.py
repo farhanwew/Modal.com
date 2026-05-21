@@ -23,6 +23,7 @@ image = (
         "huggingface_hub[hf_transfer]",
         "peft",
         "pillow",
+        "requests",
         "sentencepiece",
         "torch",
         "torchvision",
@@ -46,6 +47,19 @@ def _decode_image(image_base64: str):
 
     image_bytes = base64.b64decode(image_base64)
     return Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+
+def _load_image_url(image_url: str):
+    import requests
+    from PIL import Image
+
+    response = requests.get(
+        image_url,
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    return Image.open(io.BytesIO(response.content)).convert("RGB")
 
 
 
@@ -179,19 +193,26 @@ class QwenServer:
                 fakta=fakta,
             )
 
+        images = None
         if image_url:
-            content.append({"type": "image", "url": image_url})
+            image = _load_image_url(image_url)
+            content.append({"type": "image"})
+            images = [image]
         elif image_base64:
             image = _decode_image(image_base64)
-            content.append({"type": "image", "image": image})
+            content.append({"type": "image"})
+            images = [image]
 
         messages = [{"role": "user", "content": content}]
 
-        inputs = self.processor.apply_chat_template(
+        text = self.processor.apply_chat_template(
             messages,
             add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
+            tokenize=False,
+        )
+        inputs = self.processor(
+            text=[text],
+            images=images,
             return_tensors="pt",
         ).to(self.model.device)
 
