@@ -78,8 +78,8 @@ check that model/weights paths are identical between boots.
 ## Use
 
 ```bash
-modal deploy modal_app.py
-modal run modal_app.py --image-url "https://…" --task ocr
+modal deploy modal_paddleocr_vl_gguf.py
+modal run modal_paddleocr_vl_gguf.py --image-url "https://…" --task ocr
 
 curl -X POST "$BASE_URL/recognize" \
   -H "Content-Type: application/json" \

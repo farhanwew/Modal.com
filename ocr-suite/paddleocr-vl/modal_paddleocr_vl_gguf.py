@@ -15,6 +15,18 @@ REPO_ID = "PaddlePaddle/PaddleOCR-VL-1.6-GGUF"
 MODEL_FILE = "PaddleOCR-VL-1.6-GGUF.gguf"          # ~935 MB
 MMPROJ_FILE = "PaddleOCR-VL-1.6-GGUF-mmproj.gguf"  # ~881 MB, vision projector
 MODEL_DIR = "/models"
+# L4, and T4 was measured rather than assumed. Same document, same payload,
+# warm containers, server-side timings only:
+#
+#            detect   recognise   server   $/s        $/document
+#   L4        0.16 s     2.71 s    2.85 s   0.000222   0.000633
+#   T4        0.41 s     4.48 s    4.89 s   0.000164   0.000802   (+27%)
+#
+# T4 is 26% cheaper per second and 72% slower, so it costs more per document.
+# The intuition that T4's higher memory bandwidth (320 vs 300 GB/s) would keep
+# decoding competitive did not survive contact: per-block work is prefill-heavy
+# (~1250 image tokens each) and layout detection is pure compute, which is where
+# Turing loses. T4 also has 15 GB against 24, so slot geometry has less room.
 GPU_TYPE = os.environ.get("MODAL_GPU", "L4")
 PORT = 8080
 
@@ -35,14 +47,26 @@ FLASH_ATTN = os.environ.get("LLAMA_FLASH_ATTN", "on")
 # in one wave. Each slot gets CTX_TOTAL/PARALLEL; a block's prompt is ~1-1.5k
 # image tokens plus up to 512 out, so 4096 per slot is already generous.
 #
-# 64 slots at 3072 each rather than 32 at 4096. llama.cpp has no PagedAttention:
-# it splits context equally and permanently across slots at startup, so a slot
-# sized 4096 while blocks measure `n_tokens = 1756` in the logs wastes over half
-# its KV cache. 3072 still clears the largest budget any task gets
-# (512 * TASK_TOKEN_SCALE["table"] = 3072), so tables are not cut short, and the
-# freed memory buys twice the slots.
-PARALLEL = int(os.environ.get("LLAMA_PARALLEL", "64"))
-CTX_TOTAL = int(os.environ.get("LLAMA_CTX", str(3072 * 64)))
+# 32 slots at 6144, not 64 at 3072 — same CTX_TOTAL, so the same 5378 MiB of
+# VRAM. This trades concurrency for headroom on big tables, and it was 64x3072
+# that made the trade the wrong way round:
+#
+#   slot context      3072
+#   image prompt     ~1250   (measured; blocks logged n_tokens = 1900-2036)
+#   ----------------------
+#   room for output  ~1820
+#
+# The per-task budget for a table was already 512 * 6 = 3072, i.e. larger than
+# what the slot could physically hold, so raising max_new_tokens changed the
+# number and nothing else — the slot was the ceiling. Doubling the slot to 6144
+# lifts the real output cap to ~4900 tokens.
+#
+# The cost is wave count, not memory: a 136-block page now goes through in ~4
+# waves instead of ~2. A table truncated mid-OTSL is worse than a page that
+# finishes a few seconds later, because the damage is silent — the markup simply
+# ends and the converter renders the partial rows as a whole table.
+PARALLEL = int(os.environ.get("LLAMA_PARALLEL", "32"))
+CTX_TOTAL = int(os.environ.get("LLAMA_CTX", str(6144 * 32)))
 PARSE_CONCURRENCY = int(os.environ.get("PARSE_CONCURRENCY", str(PARALLEL)))
 
 # Same six prompts as the transformers deployment in paddleocr-vl/.
@@ -72,14 +96,30 @@ LAYOUT_TASK = {
     "table": "table", "table_caption": "ocr", "table_footnote": "ocr",
     "isolate_formula": "formula", "formula_caption": "ocr",
 }
-SKIP_CLASSES = {"abandon", "figure"}  # headers/footers/page numbers, and images
+SKIP_CLASSES = {"abandon"}  # headers/footers/page numbers
+
+# `figure` used to be skipped too, which meant charts and diagrams were dropped
+# from the output entirely — invisible to retrieval, and unrecoverable once the
+# source image is gone. They are now cropped out and referenced from the
+# markdown as ![](images/pN_bM.jpg). The crop is NOT sent to the model: a photo
+# or a logo pushed through the `chart` prompt produces confident nonsense, and
+# telling a chart from a logo is a classification problem we do not have a
+# model for. Keeping the pixels costs nothing and loses nothing.
+FIGURE_CLASSES = {"figure"}
+FIGURE_MAX_PX = 1600  # long edge; a full-page figure at 200 dpi is far bigger
+FIGURE_QUALITY = 85
 MAX_BLOCKS = 60
 
 # A text paragraph needs a couple of hundred tokens; a wide table emits OTSL for
 # every cell and can need thousands. One flat max_new_tokens truncates big tables
 # mid-row and the damage is silent — the OTSL just ends, and the converter
 # happily renders whatever rows it got. Scale the budget by block type instead.
-TASK_TOKEN_SCALE = {"table": 6, "chart": 4, "formula": 2}
+#
+# table raised 6 -> 8 alongside the slot resize above. At the default
+# max_new_tokens of 512 that is 4096, which fits the ~4900 tokens a 6144-token
+# slot leaves after a ~1250-token image prompt. Going higher would only
+# reintroduce a budget the slot cannot honour.
+TASK_TOKEN_SCALE = {"table": 8, "chart": 4, "formula": 2}
 
 app = modal.App(APP_NAME)
 models = modal.Volume.from_name("paddleocr-vl-gguf-models", create_if_missing=True)
@@ -205,33 +245,68 @@ def _reading_order(blocks: list[dict], page_w: int) -> list[dict]:
 
 
 def _otsl_to_html(otsl: str) -> str:
-    """The `table` task emits OTSL, not HTML. Duplicated across the deployments
-    on purpose — each modal_app.py stands alone."""
+    """OTSL -> HTML with real colspan AND rowspan. Duplicated across the
+    deployments on purpose — each modal_app.py stands alone.
+
+    The tags encode a grid, not a list of cells:
+        fcel  a cell with content        ecel  an empty cell
+        lcel  merged with the cell LEFT  ucel  merged with the cell ABOVE
+        xcel  merged both ways           nl    end of row
+
+    An earlier version handled lcel and treated ucel as just another empty cell,
+    which silently dropped every vertical merge: a header spanning two rows came
+    out as one header plus a blank, and nothing in the output said so. Resolving
+    each grid position to the cell that owns it gets both spans right.
+    """
     import html
     import re
 
-    rows = []
+    grid = []
     for raw_row in otsl.split("<nl>"):
         tokens = re.findall(r"<(fcel|ecel|lcel|ucel|xcel)>([^<]*)", raw_row)
-        if not tokens:
-            continue
-        cells: list[list] = []
-        for tag, text in tokens:
-            if tag in ("lcel", "xcel") and cells:
-                cells[-1][1] += 1
-            elif tag in ("ecel", "ucel"):
-                cells.append(["", 1])
-            else:
-                cells.append([text.strip(), 1])
-        rows.append(cells)
-    if not rows:
+        if tokens:
+            grid.append([(tag, text.strip()) for tag, text in tokens])
+    if not grid:
         return ""
+
+    width = max(len(r) for r in grid)
+    grid = [r + [("ecel", "")] * (width - len(r)) for r in grid]
+
+    owner = [[(r, c) for c in range(width)] for r in range(len(grid))]
+    for r, row in enumerate(grid):
+        for c, (tag, _) in enumerate(row):
+            if tag == "lcel" and c > 0:
+                owner[r][c] = owner[r][c - 1]
+            elif tag == "ucel" and r > 0:
+                owner[r][c] = owner[r - 1][c]
+            elif tag == "xcel":
+                if r > 0:
+                    owner[r][c] = owner[r - 1][c]
+                elif c > 0:
+                    owner[r][c] = owner[r][c - 1]
+
+    spans: dict = {}
+    for r in range(len(grid)):
+        for c in range(width):
+            a = owner[r][c]
+            s = spans.setdefault(a, [0, set()])
+            if r == a[0]:
+                s[0] += 1
+            s[1].add(r)
+
     out = ['<table border="1" style="border-collapse:collapse">']
-    for cells in rows:
+    for r in range(len(grid)):
         out.append("<tr>")
-        for text, span in cells:
-            attr = f' colspan="{span}"' if span > 1 else ""
-            out.append(f"<td{attr}>{html.escape(text)}</td>")
+        for c in range(width):
+            if owner[r][c] != (r, c):
+                continue
+            colspan, rows_hit = spans[(r, c)]
+            attr = ""
+            if colspan > 1:
+                attr += f' colspan="{colspan}"'
+            if len(rows_hit) > 1:
+                attr += f' rowspan="{len(rows_hit)}"'
+            out.append(f"<td{attr}>{html.escape(grid[r][c][1])}</td>")
         out.append("</tr>")
     out.append("</table>")
     return "".join(out)
@@ -296,6 +371,23 @@ def _as_markdown(kind: str, text: str, table_format: str = "html") -> str:
     if kind == "isolate_formula":
         return f"$$\n{text}\n$$"
     return text
+
+
+def _figure_jpeg_b64(pil) -> str:
+    """A figure crop, downscaled and JPEG'd. Full-resolution crops of a 200 dpi
+    page run to megabytes each, and they are only ever looked at, not OCR'd."""
+    from PIL import Image
+
+    img = pil.convert("RGB")
+    if max(img.size) > FIGURE_MAX_PX:
+        scale = FIGURE_MAX_PX / max(img.size)
+        img = img.resize(
+            (max(1, int(img.width * scale)), max(1, int(img.height * scale))),
+            Image.Resampling.LANCZOS,
+        )
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=FIGURE_QUALITY)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
 def _pil_data_url(pil) -> str:
@@ -564,7 +656,7 @@ class LlamaServer:
                     pdf_dpi=int(payload.get("pdf_dpi", 200)),
                     conf=float(payload.get("conf", 0.25)),
                     iou=float(payload.get("iou", 0.45)),
-                    max_new_tokens=int(payload.get("max_new_tokens", 512)),
+                    max_new_tokens=int(payload.get("max_new_tokens", 4096)),
                     table_format=str(payload.get("table_format", "html")),
                 ):
                     yield json.dumps(chunk) + "\n"
@@ -590,7 +682,7 @@ class LlamaServer:
                     image_url=payload.get("image_url"),
                     image_base64=payload.get("image_base64"),
                     task=task,
-                    max_new_tokens=int(payload.get("max_new_tokens", 1024)),
+                    max_new_tokens=int(payload.get("max_new_tokens", 4096)),
                 ):
                     yield json.dumps(chunk) + "\n"
 
@@ -652,7 +744,7 @@ class LlamaServer:
         self,
         image_url=None, image_base64=None, pdf_url=None, pdf_base64=None,
         pdf_dpi: int = 200, conf: float = 0.25, iou: float = 0.45,
-        max_new_tokens: int = 512, table_format: str = "html",
+        max_new_tokens: int = 4096, table_format: str = "html",
     ):
         """Detect layout blocks, then recognise each with the task that suits its
         type, all inside this container — a page can have 30+ blocks and a hop
@@ -680,6 +772,12 @@ class LlamaServer:
                 if multi and b["page"] != cur:
                     cur = b["page"]
                     parts.append(f"---\n\n**Page {cur + 1} / {len(pages)}**")
+                if b.get("image_name"):
+                    # Relative path, not a data URI: the client writes the bytes
+                    # next to the markdown so a downloaded bundle resolves, and
+                    # rewrites these to data URIs only for its own preview.
+                    parts.append(f"![{b['type']} p{b['page'] + 1}](images/{b['image_name']})")
+                    continue
                 md = _as_markdown(b["type"], b.get("text", ""), table_format)
                 if md:
                     # Silent truncation of a table is worse than a visible gap —
@@ -704,15 +802,40 @@ class LlamaServer:
 
         from concurrent.futures import ThreadPoolExecutor
 
+        # name -> base64 JPEG. Emitted once, in the event where the block lands,
+        # never in `blocks`: that list is re-sent on every update, so carrying
+        # image bytes in it would repeat every figure on every tick.
+        pending_images: dict[str, str] = {}
+        emitted_images: set[str] = set()
+
+        def drain_images() -> dict[str, str]:
+            """Snapshot what is ready and has not gone out yet. Deliberately not
+            a swap-and-clear: worker threads keep writing into this dict while we
+            emit, and a swap can drop an entry written during the handover.
+            Anything missed here simply rides the next event, or the final one."""
+            fresh = {
+                k: v for k, v in list(pending_images.items()) if k not in emitted_images
+            }
+            emitted_images.update(fresh)
+            return fresh
+
         def recognise(item):
             page_idx, blk, page = item
             x1, y1, x2, y2 = blk["bbox"]
+            crop = page.crop((x1, y1, x2, y2))
+
+            if blk["type"] in FIGURE_CLASSES:
+                name = f"p{page_idx + 1}_b{x1}_{y1}.jpg"
+                blk.update(page=page_idx, task="figure", text="", image_name=name)
+                pending_images[name] = _figure_jpeg_b64(crop)
+                return blk
+
             task = LAYOUT_TASK.get(blk["type"], "ocr")
             budget = max_new_tokens * TASK_TOKEN_SCALE.get(task, 1)
             truncated = False
             try:
                 text, truncated = self._llama_generate(
-                    _pil_data_url(page.crop((x1, y1, x2, y2))), task, budget
+                    _pil_data_url(crop), task, budget
                 )
             except Exception as e:
                 text, blk["error"] = "", str(e)
@@ -729,6 +852,7 @@ class LlamaServer:
                 yield {
                     "blocks": done, "markdown": render(), "total": total,
                     "pages": len(pages), "progress": len(done),
+                    "new_images": drain_images(),
                     "detect_s": round(det_ms / 1000, 2),
                     "recognise_s": round(time.time() - t0, 2),
                     "elapsed_s": round(det_ms / 1000 + time.time() - t0, 2),
@@ -744,9 +868,12 @@ class LlamaServer:
         if truncated:
             kinds = ", ".join(sorted({b["type"] for b in truncated}))
             print(f"[TRUNCATED] {len(truncated)}/{len(done)} blocks hit the cap ({kinds})")
+        figures = [b for b in done if b.get("image_name")]
         yield {
             "blocks": done, "markdown": render(), "total": total,
             "pages": len(pages), "progress": len(done),
+            "new_images": drain_images(),  # sweep anything the last tick missed
+            "figure_count": len(figures),
             "detect_s": round(det_ms / 1000, 2),
             "recognise_s": round(recognise_s, 2),
             "elapsed_s": round(det_ms / 1000 + recognise_s, 2),
@@ -878,7 +1005,7 @@ class LlamaServer:
         image_url: str | None = None,
         image_base64: str | None = None,
         task: str = "ocr",
-        max_new_tokens: int = 1024,
+        max_new_tokens: int = 4096,
     ) -> dict[str, Any]:
         """Drain the stream to a single dict, for `modal run` and .remote()."""
         last: dict[str, Any] = {}
@@ -890,7 +1017,7 @@ class LlamaServer:
 
 
 @app.local_entrypoint()
-def main(image_url: str, task: str = "ocr", max_new_tokens: int = 512):
+def main(image_url: str, task: str = "ocr", max_new_tokens: int = 4096):
     res = LlamaServer().recognize.remote(
         image_url=image_url, task=task, max_new_tokens=max_new_tokens
     )

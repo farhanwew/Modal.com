@@ -1,0 +1,30 @@
+# For app.py — the ZeroGPU / transformers variant.
+#
+# Deliberately short. The Space build injects its own pins on top of this file:
+#
+#     pip install -r requirements.txt "torch<=2.11.0" gradio[oauth,mcp]==6.22.0 \
+#                 "uvicorn>=0.14.0" "websockets>=10.4" spaces==0.51.1
+#
+# so listing gradio, torch or spaces here can only conflict with it — a
+# `gradio>=5.0,<6` line here failed the build outright against their 6.22.0.
+# huggingface_hub is preinstalled in the base image too. Let the platform win.
+
+transformers>=5.0
+accelerate
+Pillow>=10
+
+# PDF input. Without it the app runs and says so in the header.
+pymupdf>=1.24
+
+# --- layout routing (optional) -----------------------------------------------
+# Uncomment for per-block routing: DocLayout-YOLO finds the blocks and each one
+# goes to the task that fits it (ocr / table / formula). Without it a page goes
+# to the model whole — fine for plain text, but table structure and formulas are
+# lost.
+#
+# Left off by default because both packages pin torch/ultralytics ranges of
+# their own, and the build already carries a hard "torch<=2.11.0". Add them once
+# the Space builds green, so a resolution failure is unambiguous.
+#
+# torchvision
+# doclayout-yolo==0.0.3

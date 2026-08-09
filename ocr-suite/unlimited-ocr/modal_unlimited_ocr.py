@@ -129,6 +129,19 @@ def _read_result_md(out_dir: str) -> str:
     return result.strip()
 
 
+def _read_result_images(out_dir: str) -> dict[str, str]:
+    images_dir = os.path.join(out_dir, "images")
+    if not os.path.isdir(images_dir):
+        return {}
+    images = {}
+    for name in os.listdir(images_dir):
+        path = os.path.join(images_dir, name)
+        if os.path.isfile(path):
+            with open(path, "rb") as f:
+                images[name] = base64.b64encode(f.read()).decode("ascii")
+    return images
+
+
 class _ThreadTargetedStdout:
     """baidu/Unlimited-OCR's infer()/infer_multi() stream generated tokens by
     print()-ing them from inside model.generate() (see TPSTextStreamer in the
@@ -305,7 +318,12 @@ class UnlimitedOCRServer:
                 raise RuntimeError(f"Inference failed: {'; '.join(errors)}")
 
             final_text = returned.get("text") or _read_result_md(out_dir) or accumulated.strip()
-            yield {"text": final_text, "done": True, "pages": len(paths)}
+            yield {
+                "text": final_text,
+                "done": True,
+                "pages": len(paths),
+                "new_images": _read_result_images(out_dir),
+            }
         finally:
             shutil.rmtree(out_dir, ignore_errors=True)
 

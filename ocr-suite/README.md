@@ -1,31 +1,49 @@
 # ocr-suite
 
-Three OCR deployments that used to live in `paddleocr-vl/`, `paddleocr-vl-gguf/` and
-`unlimited-ocr/`, merged into one folder behind **one** Gradio client with a model dropdown.
+OCR deployments and one local Gradio client. Each Modal script is an independent app; the
+client selects among configured remote backends and the local OpenDataLoader path.
 
 Each `modal_*.py` is still its own independent Modal app — they cannot be merged into one
 script, because they need different base images (llama.cpp CUDA vs. a torch/transformers
 `debian_slim`) and different GPUs. What is shared is the client.
 
 ```
-gradio_app.py                  one UI, three backends, model chosen from a dropdown
-modal_paddleocr_vl.py          app "paddleocr-vl"        transformers
-modal_paddleocr_vl_gguf.py     app "paddleocr-vl-gguf"   llama.cpp
-modal_unlimited_ocr.py         app "unlimited-ocr"       DeepSeek-OCR-style VLM
-README.paddleocr-vl.md         per-app notes, kept verbatim from the old folders
-README.paddleocr-vl-gguf.md
-README.unlimited-ocr.md
-Dockerfile.paddleocr-vl        local/non-Modal builds
-Dockerfile.unlimited-ocr
+gradio_app.py                             one UI, backends chosen from a dropdown
+unlimited-ocr/modal_unlimited_ocr.py       app "unlimited-ocr"       DeepSeek-OCR-style VLM
+unlimited-ocr/README.md
+paddleocr-vl/modal_paddleocr_vl.py        app "paddleocr-vl"        transformers
+paddleocr-vl/modal_paddleocr_vl_gguf.py   app "paddleocr-vl-gguf"   llama.cpp
+paddleocr-vl/modal_paddleocr_vl_gguf_official.py  official PaddleOCR pipeline + llama.cpp
+paddleocr-vl/README.paddleocr-vl.md       transformers details
+paddleocr-vl/README.paddleocr-vl-gguf.md  custom GGUF details
+glm-ocr/modal_glm_ocr_transformers.py     app "glm-ocr-transformers" — the default GLM-OCR path
+glm-ocr/modal_glm_ocr_vllm.py             app "glm-ocr-vllm"
+ glm-ocr/modal_glm_ocr_sglang.py           app "glm-ocr-sglang" (stopped)
+mineru/modal_mineru.py
+mineru/modal_mineru_gguf.py
+docling/modal_docling.py
+Dockerfile                                the Gradio client, JRE included
 ```
 
 ## Which model to pick
 
-| | Speed | Structure | Use when |
+| | Where | Structure | Use when |
 | --- | --- | --- | --- |
-| **PaddleOCR-VL · GGUF** | 145–247 tok/s | tables, formulas, charts, seals | default |
-| **PaddleOCR-VL · transformers** | 22–28 tok/s | same | checking whether GGUF costs accuracy |
-| **Unlimited-OCR** | — | whole-page parse, prompt-steerable | free-text prompting, different model's opinion |
+| **OpenDataLoader** | **local CPU** | headings, tables, images, reading order | **the PDF has a text layer — try this first** |
+| **PaddleOCR-VL · GGUF** | Modal GPU | tables, formulas, charts, seals | scanned pages; the default OCR path |
+| **PaddleOCR-VL · transformers** | Modal GPU | same | checking whether GGUF costs accuracy |
+| **Unlimited-OCR** | Modal GPU | whole-page parse, prompt-steerable | free-text prompting, a different model's opinion |
+
+**Reach for OpenDataLoader before any of the OCR backends.** It reads the text the PDF already
+contains rather than guessing it back from pixels: exact, no GPU, no upload, and measured at
+**1.2 s** for a page the GPU pipeline spends seconds on. It runs in the Gradio process (Java 11+
+plus `opendataloader-pdf`; the app finds a JDK that is installed but off `PATH`, and hides the
+backend with a reason if it cannot).
+
+Its limit is the mirror image of that strength: a scanned page has no text layer, so it returns
+nothing and says so. That is what the OCR backends are for. Deciding between them per page is the
+triage described in the repo root — cheap to check, and it is the difference between seconds and
+milliseconds for a digital PDF.
 
 The two PaddleOCR-VL apps run the **same weights** through different runtimes — 7–9× apart on
 identical hardware. GGUF is not smaller here (935 MB model + 881 MB mmproj ≈ the 1.9 GB
@@ -34,10 +52,28 @@ safetensors); it is a speed win only.
 ## Deploy
 
 ```bash
-modal deploy modal_paddleocr_vl_gguf.py
-modal deploy modal_paddleocr_vl.py
-modal deploy modal_unlimited_ocr.py
+modal deploy paddleocr-vl/modal_paddleocr_vl_gguf.py
+modal deploy paddleocr-vl/modal_paddleocr_vl.py
+modal deploy unlimited-ocr/modal_unlimited_ocr.py
 ```
+
+### Official PaddleOCR pipeline variant
+
+`paddleocr-vl/modal_paddleocr_vl_gguf_official.py` keeps the same GGUF + `llama-server` backend, but
+replaces the custom DocLayout-YOLO parser with PaddleOCR's official `PaddleOCRVL` pipeline. It is a
+separate app for side-by-side testing and does not change the existing GGUF deployment.
+
+```bash
+modal deploy paddleocr-vl/modal_paddleocr_vl_gguf_official.py
+modal run paddleocr-vl/modal_paddleocr_vl_gguf_official.py --image-url "https://paddle-model-ecology.bj.bcebos.com/paddlex/imgs/demo_image/paddleocr_vl_demo.png"
+```
+
+This variant installs CPU PaddlePaddle and `paddleocr[doc-parser]`; its `/parse-page` route uses the
+official layout analysis, page restructuring, and merged-table handling while recognition remains
+served by the local GPU GGUF `llama-server`. CPU layout is intentional here to avoid installing a
+second multi-gigabyte CUDA runtime inside the llama.cpp image. `PP-DocLayoutV3` is persisted in the
+Modal Volume `paddleocr-vl-official-paddlex-cache`, so its first download is not repeated by new
+containers.
 
 App names come from `modal.App("…")` inside each script, not the filename — use those for
 `modal app logs`.
@@ -56,10 +92,12 @@ UI is usable with only one deployed.
 
 ### In Docker
 
-`Dockerfile` builds the merged client — no GPU, no weights, just the HTTP frontend.
+`Dockerfile` builds the merged client. The three Modal models stay remote; the only backend baked
+in is OpenDataLoader, which needs `openjdk-17-jre-headless` — without a JRE it hides itself with
+*"no Java 11+ runtime found"*.
 
 ```bash
-cp .env.example .env          # three base URLs
+cp .env.example .env          # the three base URLs
 docker build -t ocr-suite-ui .
 docker run --rm -p 7870:7860 --env-file .env ocr-suite-ui
 ```
@@ -75,14 +113,42 @@ backends: they scale to zero, and polling would keep GPU containers alive and bi
 
 ### Tabs
 
-- **Document Parsing** — pages and PDFs. PaddleOCR-VL runs DocLayout-YOLO first and routes each
-  block to the task that fits it; Unlimited-OCR parses each page in one pass. Options swap with
-  the selected model (`max_new_tokens`/`conf`/table format vs. mode/NGRAM/prompt).
+- **Document Parsing** — pages and PDFs, by upload **or URL**. PaddleOCR-VL runs DocLayout-YOLO
+  first and routes each block to the task that fits it; Unlimited-OCR parses each page in one
+  pass. Options swap with the selected model (`max_new_tokens`/`conf`/table format vs.
+  mode/NGRAM/prompt). An **Input document** tab shows thumbnails of what is about to be parsed.
+
+  Prefer the URL when you have one: it is the single biggest lever on wall clock. A 27-page PDF
+  measured 51 s of server execution against 144 s end to end, the difference being base64 upload
+  from the client. With a URL, Modal fetches the file over datacentre network and that gap
+  disappears. Uploads preview instantly (the bytes are already local); a URL previews only on
+  demand, because fetching it client-side would undo the saving — hence the separate button.
+
+  Preview renders every page by default (`PREVIEW_MAX_PAGES=0`) at `PREVIEW_DPI` (80). Set a
+  positive cap for very large PDFs. The parse always uses every page.
 - **Recognize** — one image, one task, no layout detection. PaddleOCR-VL only; Unlimited-OCR has
   no task concept.
 - **Compare** — the same document through up to three models, run sequentially, panes side by
   side. This is the tab for the question the benchmarks never answered: whether GGUF's speed
   costs accuracy on tables and formulas.
+
+The download bundle is `document.md` + `document.html` + `images/`. The HTML is OpenDataLoader's
+own rendering when that backend produced it, and a markdown-it conversion otherwise; the converter
+runs with `html=True` because PaddleOCR-VL's table blocks are already raw `<table>` markup with
+colspan and rowspan, and escaping them would put visible tags on the page.
+
+**Merged cells need `markdown_with_html`.** Plain markdown is pipe tables, which have no concept
+of a span, so every merge flattens to a blank. The flag is on in `_odl_run`; measured on a table
+whose grid genuinely omits the internal borders:
+
+```
+markdown              colspan=0 rowspan=0
+markdown_with_html    <td rowspan="2">No</td> <td colspan="2">Semester</td>
+html                  <td rowspan="2">No</td> <td colspan="2">Semester</td>
+```
+
+Extra formats (`json`, `text`, `pdf`, `tagged-pdf`) are ticked per run and land in `extras/` in the
+ZIP; the **Extras** tab previews whichever is text.
 
 ### Streaming and scrolling
 
@@ -104,4 +170,21 @@ without the matching text tokens and rendered dark-on-dark.
   base64 JPEG. The client re-encodes images above `JPEG_ABOVE_KB` (400) at quality 92; PDFs go
   over verbatim.
 - **Cold starts reset TLS.** A request that arrives while a container is starting can fail at the
-  handshake with `ConnectionReset`, not a timeout. Retrying once it is warm is the fix.
+   handshake with `ConnectionReset`, not a timeout. Retrying once it is warm is the fix.
+
+## Current Backend Map
+
+| Backend | Script | Status |
+| --- | --- | --- |
+| PaddleOCR-VL GGUF | `paddleocr-vl/modal_paddleocr_vl_gguf.py` | active |
+| PaddleOCR-VL transformers | `paddleocr-vl/modal_paddleocr_vl.py` | active |
+| PaddleOCR official + GGUF | `paddleocr-vl/modal_paddleocr_vl_gguf_official.py` | active |
+| Unlimited-OCR | `unlimited-ocr/modal_unlimited_ocr.py` | active |
+| GLM-OCR transformers | `glm-ocr/modal_glm_ocr_transformers.py` | active |
+| GLM-OCR vLLM | `glm-ocr/modal_glm_ocr_vllm.py` | active |
+| GLM-OCR GGUF | `glm-ocr/modal_glm_ocr_gguf.py` | active |
+| GLM-OCR SGLang | `glm-ocr/modal_glm_ocr_sglang.py` | stopped; do not deploy |
+| MinerU | `mineru/modal_mineru.py`, `mineru/modal_mineru_gguf.py` | available |
+| Docling | `docling/modal_docling.py` | available |
+
+The SGLang deployment is intentionally stopped. Its script is retained for reference only.

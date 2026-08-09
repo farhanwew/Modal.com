@@ -43,7 +43,7 @@ modal setup
 
 The model repo is public, so no Hugging Face secret is required. If it ever becomes gated, add
 `secrets=[modal.Secret.from_name("huggingface-secret")]` to both the `@app.cls(...)` and `@app.function(...)`
-decorators in `modal_app.py`, and create the secret with:
+decorators in `unlimited-ocr/modal_unlimited_ocr.py`, and create the secret with:
 
 ```bash
 modal secret create huggingface-secret HF_TOKEN=hf_your_token_here
@@ -52,7 +52,7 @@ modal secret create huggingface-secret HF_TOKEN=hf_your_token_here
 ## Test once
 
 ```bash
-modal run modal_app.py --image-url "https://example.com/document.jpg"
+modal run unlimited-ocr/modal_unlimited_ocr.py --image-url "https://example.com/document.jpg"
 ```
 
 This streams partial text to your terminal as it's generated, then prints the final cleaned result.
@@ -60,7 +60,7 @@ This streams partial text to your terminal as it's generated, then prints the fi
 ## Serve during development
 
 ```bash
-modal serve modal_app.py
+modal serve unlimited-ocr/modal_unlimited_ocr.py
 ```
 
 Modal prints a temporary base URL for `web_app`, e.g. `https://<workspace>--unlimited-ocr-web-app-dev.modal.run`
@@ -109,7 +109,7 @@ Optional generation fields:
 ## Deploy
 
 ```bash
-modal deploy modal_app.py
+modal deploy unlimited-ocr/modal_unlimited_ocr.py
 ```
 
 After deployment, stream logs with:
@@ -141,7 +141,7 @@ uv run gradio_app.py
 ### Running the UI in Docker
 
 `Dockerfile` containerises **the Gradio client only** — no GPU, no model weights. The model stays on Modal, whose
-image is defined in code via `modal.Image` in `modal_app.py`; there is deliberately no Dockerfile for that side.
+image is defined in code via `modal.Image` in `unlimited-ocr/modal_unlimited_ocr.py`; there is deliberately no Dockerfile for that side.
 
 ```bash
 docker build -t unlimited-ocr-ui .

@@ -1,0 +1,29 @@
+# --- required ---------------------------------------------------------------
+gradio>=5.0,<6
+requests>=2,<3
+Pillow>=10
+huggingface_hub>=0.25
+
+# --- PDF input ---------------------------------------------------------------
+# Without this the app still runs; PDF upload is disabled and the notice in the
+# header says so. Small and safe to keep.
+pymupdf>=1.24
+
+# --- layout routing (optional, heavy) ----------------------------------------
+# Uncomment all three together to get per-block routing: DocLayout-YOLO finds
+# the blocks and each one goes to the task that fits it (ocr / table / formula).
+# Without them a page is sent to the model whole — fine for plain text, but
+# table structure and formulas are lost.
+#
+# The cost is real: this pulls torch + ultralytics. Pin the CPU wheels on a CPU
+# Space or pip resolves the CUDA build instead, ~2.5 GB, and the Space build
+# will likely time out. Drop the --extra-index-url line on a paid GPU Space,
+# where the app calls YOLO with device="cuda".
+#
+# --extra-index-url https://download.pytorch.org/whl/cpu
+# torch
+# torchvision
+# doclayout-yolo==0.0.3
+
+# `spaces` is not listed: it is preinstalled on ZeroGPU hardware, and the import
+# in app.py is guarded so the file runs anywhere without it.

@@ -43,7 +43,7 @@ Hub requests; adding an `HF_TOKEN` secret only affects download rate limits.)
 ## Deploy and use
 
 ```bash
-modal deploy modal_app.py
+modal deploy modal_paddleocr_vl.py
 modal app logs paddleocr-vl
 ```
 
@@ -63,7 +63,7 @@ curl -N -X POST "$BASE_URL/recognize" \
 | `max_new_tokens` | `int` | 1024 | Dense pages need more; this dominates latency (see below) |
 | `max_pixels` | `int` | 1003520 (2048·28·28 for `spotting`) | Image-token budget: the image is cut into 28×28-pixel tokens, so this ÷ 784 is how many image tokens the model attends over. Halving it roughly halves prefill (see below) but resolves small text less reliably. |
 
-Smoke test without deploying: `modal run modal_app.py --image-url "…" --task ocr`.
+Smoke test without deploying: `modal run modal_paddleocr_vl.py --image-url "…" --task ocr`.
 
 ### `/parse-page` — page-level document parsing
 
@@ -129,7 +129,7 @@ dtype=torch.bfloat16`):
   | Model default (`use_cache: false`) | ~2.8 tok/s | ~180 s |
   | `generate(..., use_cache=True)` | 29–49 tok/s | ~17 s |
 
-  `modal_app.py` passes `use_cache=True` explicitly. Each request logs
+  `modal_paddleocr_vl.py` passes `use_cache=True` explicitly. Each request logs
   `[GEN] task=… chunks=… elapsed_s=… chunks_per_s=…` so this stays easy to re-check.
 - **Attention** is pinned to `sdpa` (`[DEVICE] … attn=sdpa`). **FlashAttention-2 was tried and
   rejected**, and the reason is structural rather than a packaging problem: transformers validates FA2

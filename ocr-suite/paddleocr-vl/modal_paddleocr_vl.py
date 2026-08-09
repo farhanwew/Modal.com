@@ -477,6 +477,7 @@ class PaddleOCRVLServer:
                     )
             except Exception as e:  # surfaced after the stream drains
                 errors.append(str(e))
+                streamer.on_finalized_text("", stream_end=True)
 
         import time
 
