@@ -44,6 +44,7 @@ ENV PADDLEOCR_VL_GGUF_BASE_URL="" \
     MINERU_BASE_URL="" \
     MINERU_GGUF_Q8_BASE_URL="" \
     MINERU_GGUF_Q4_BASE_URL=""
+    MINERU_PIPELINE_BASE_URL=""
 
 # Optional tuning, same defaults as the script.
 ENV JPEG_QUALITY=92 \

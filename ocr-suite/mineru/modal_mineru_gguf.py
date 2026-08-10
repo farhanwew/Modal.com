@@ -77,6 +77,17 @@ def _markdown(blocks: list[dict[str, Any]]) -> str:
     return "\n\n".join(parts)
 
 
+def _embedded_images(doc) -> dict[str, str]:
+    images = {}
+    for page_number, page in enumerate(doc, 1):
+        for image_number, image in enumerate(page.get_images(full=True), 1):
+            xref = image[0]
+            extracted = doc.extract_image(xref)
+            name = f"page_{page_number:04d}_embedded_{image_number:04d}.{extracted['ext']}"
+            images[name] = base64.b64encode(extracted["image"]).decode("ascii")
+    return images
+
+
 @app.cls(
     image=image,
     gpu=GPU_TYPE,
@@ -219,6 +230,7 @@ class MinerUGGUF:
                 dpi = max(72, min(int(payload.get("pdf_dpi", 200)), 300))
                 doc = pymupdf.open(stream=self._read(source), filetype="pdf")
                 blocks = []
+                embedded_images = _embedded_images(doc)
                 try:
                     for start in range(0, len(doc), PDF_BATCH_SIZE):
                         page_images = []
@@ -238,6 +250,7 @@ class MinerUGGUF:
                             yield json.dumps({
                                 "text": _markdown(blocks), "blocks": blocks,
                                 "pages": page_number, "done": page_number == len(doc),
+                                "embedded_images": embedded_images if page_number == len(doc) else {},
                             }) + "\n"
                 finally:
                     doc.close()

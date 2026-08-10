@@ -21,6 +21,7 @@ glm-ocr/modal_glm_ocr_vllm.py             app "glm-ocr-vllm"
  glm-ocr/modal_glm_ocr_sglang.py           app "glm-ocr-sglang" (stopped)
 mineru/modal_mineru.py
 mineru/modal_mineru_gguf.py
+mineru/modal_mineru_pipeline.py          app "mineru-pipeline" — official pipeline experiment
 docling/modal_docling.py
 Dockerfile                                the Gradio client, JRE included
 ```
@@ -137,6 +138,15 @@ own rendering when that backend produced it, and a markdown-it conversion otherw
 runs with `html=True` because PaddleOCR-VL's table blocks are already raw `<table>` markup with
 colspan and rowspan, and escaping them would put visible tags on the page.
 
+MinerU PDF artifacts preserve embedded PDF images when the document contains image resources. Those files
+are copied directly from the PDF stream at their original format/quality; raster crops remain the fallback
+for detected visual blocks without a matching embedded resource.
+
+The official pipeline experiment uses MinerU's `pipeline` backend with PP-DocLayoutV2, OCR, formula, and
+table models. It emits official `middle.json`, `model.json`, `content_list.json`, and `content_list_v2.json`
+files into the ZIP `extras/` directory. It processes all PDF pages by default; callers may send
+`max_pages` to intentionally limit a request.
+
 **Merged cells need `markdown_with_html`.** Plain markdown is pipe tables, which have no concept
 of a span, so every merge flattens to a blank. The flag is on in `_odl_run`; measured on a table
 whose grid genuinely omits the internal borders:
@@ -185,6 +195,7 @@ without the matching text tokens and rendered dark-on-dark.
 | GLM-OCR GGUF | `glm-ocr/modal_glm_ocr_gguf.py` | active |
 | GLM-OCR SGLang | `glm-ocr/modal_glm_ocr_sglang.py` | stopped; do not deploy |
 | MinerU | `mineru/modal_mineru.py`, `mineru/modal_mineru_gguf.py` | available |
+| MinerU official pipeline | `mineru/modal_mineru_pipeline.py` | active experiment |
 | Docling | `docling/modal_docling.py` | available |
 
 The SGLang deployment is intentionally stopped. Its script is retained for reference only.

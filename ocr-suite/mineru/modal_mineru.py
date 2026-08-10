@@ -60,6 +60,17 @@ def _markdown(blocks: list[dict[str, Any]]) -> str:
     return "\n\n".join(parts)
 
 
+def _embedded_images(doc) -> dict[str, str]:
+    images = {}
+    for page_number, page in enumerate(doc, 1):
+        for image_number, image in enumerate(page.get_images(full=True), 1):
+            xref = image[0]
+            extracted = doc.extract_image(xref)
+            name = f"page_{page_number:04d}_embedded_{image_number:04d}.{extracted['ext']}"
+            images[name] = base64.b64encode(extracted["image"]).decode("ascii")
+    return images
+
+
 @app.cls(
     image=image,
     gpu=GPU_TYPE,
@@ -177,6 +188,7 @@ class MinerU:
                 dpi = max(72, min(int(payload.get("pdf_dpi", 200)), 300))
                 doc = fitz.open(stream=self._read(source), filetype="pdf")
                 blocks = []
+                embedded_images = _embedded_images(doc)
                 try:
                     for page_number, page in enumerate(doc, 1):
                         pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72))
@@ -191,6 +203,7 @@ class MinerU:
                                 "text": _markdown(blocks),
                                 "blocks": blocks,
                                 "pages": page_number,
+                                "embedded_images": embedded_images if page_number == len(doc) else {},
                                 "done": page_number == len(doc),
                             }
                         ) + "\n"

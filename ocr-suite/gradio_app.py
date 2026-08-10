@@ -122,6 +122,13 @@ BACKENDS: dict[str, dict] = {
         "family": "mineru",
         "repo": "https://huggingface.co/mradermacher/MinerU2.5-Pro-2604-1.2B-GGUF",
     },
+    "MinerU · official pipeline": {
+        "env": "MINERU_PIPELINE_BASE_URL",
+        "parse": "/parse",
+        "recognize": None,
+        "family": "mineru_pipeline",
+        "repo": "https://github.com/opendatalab/MinerU",
+    },
     "Unlimited-OCR": {
         "env": "UNLIMITED_OCR_BASE_URL",
         "parse": "/parse",
@@ -507,7 +514,8 @@ def _write_images(run: Path, images: dict[str, str]) -> None:
 
 
 def _mineru_artifacts(run: Path, file_path: str | None, source_url: str | None,
-                       blocks: list[dict], is_pdf: bool) -> None:
+                       blocks: list[dict], is_pdf: bool,
+                       embedded_images: dict[str, str] | None = None) -> None:
     """Write MinerU JSON, bbox preview, and detected visual crops into the ZIP."""
     import pymupdf
     from PIL import Image, ImageDraw
@@ -540,6 +548,7 @@ def _mineru_artifacts(run: Path, file_path: str | None, source_url: str | None,
     if is_pdf:
         doc = pymupdf.open(stream=raw, filetype="pdf")
         try:
+            _write_images(run, embedded_images or {})
             for index, block in enumerate(blocks, 1):
                 page_index = int(block.get("page", 1)) - 1
                 bbox = block.get("bbox")
@@ -861,10 +870,11 @@ def run_parse(
                 if ev.get("done") and ev.get("official_results"):
                     extras = run / "extras"
                     extras.mkdir(exist_ok=True)
-                    (extras / "paddleocr-official.json").write_text(
-                        json.dumps(ev["official_results"], ensure_ascii=False, indent=2),
-                        encoding="utf-8",
-                    )
+                    for filename, result in ev["official_results"].items():
+                        (extras / filename).write_text(
+                            json.dumps(result, ensure_ascii=False, indent=2),
+                            encoding="utf-8",
+                        )
 
                 if cfg["family"] == "paddle":
                     content = ev.get("markdown", "")
@@ -909,9 +919,18 @@ def run_parse(
                         _mineru_artifacts(
                             run, file_path, source_url, ev.get("blocks") or [],
                             next(iter(payload)).startswith("pdf_"),
+                            ev.get("embedded_images") or {},
                         )
                     except Exception as artifact_error:
                         status += f" · artifact warning: {artifact_error}"
+                if ev.get("done") and cfg["family"] == "mineru_pipeline":
+                    extras = run / "extras"
+                    extras.mkdir(exist_ok=True)
+                    for filename, result in (ev.get("official_results") or {}).items():
+                        (extras / filename).write_text(
+                            json.dumps(result, ensure_ascii=False, indent=2),
+                            encoding="utf-8",
+                        )
                 bundle = _build_zip(run, content, name) if ev.get("done") else None
                 yield _inline_images(content, run), content, status, bundle, str(run)
         if not completed:
